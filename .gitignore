@@ -7,3 +7,5 @@ __pycache__
 env/
 venv/
 *.onnx
+.whl
+nano_vllm.egg-info/
