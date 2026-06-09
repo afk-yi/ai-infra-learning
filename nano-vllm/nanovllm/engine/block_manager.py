@@ -100,6 +100,15 @@ class BlockManager:
         seq.num_cached_tokens = 0
         seq.block_table.clear()
 
+    def free_tail_blocks(self, seq: Sequence, n: int):
+        for block_id in seq.block_table[-n:]:
+            block = self.blocks[block_id]
+            block.ref_count -= 1
+            if block.ref_count == 0:
+                self._deallocate_block(block_id)
+        seq.block_table = seq.block_table[:-n]
+        seq.num_cached_tokens = len(seq.block_table) * self.block_size
+
     def can_append(self, seq: Sequence) -> bool:
         return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
 
