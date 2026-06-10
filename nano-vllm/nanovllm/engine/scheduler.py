@@ -114,6 +114,9 @@ class Scheduler:
                 decode_candidates = [s for s in decode_candidates if s not in defer]
 
         for seq in decode_candidates:
+            if not self.block_manager.can_append(seq):
+                self.running.appendleft(seq)
+                continue
             seq.num_scheduled_tokens = 1
             seq.is_prefill = False
             self.block_manager.may_append(seq)
