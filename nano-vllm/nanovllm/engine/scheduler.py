@@ -39,10 +39,11 @@ class Scheduler:
 
         # Phase 1: Prefill from waiting
         fresh_running = []  # seqs that complete prefill this step; added to running after Phase 2
+        decode_reserve = len(self.running) if self.running else 0
         while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
             seq = self.waiting[0][2]
-            remaining = self.max_num_batched_tokens - num_batched_tokens
-            if remaining == 0:
+            remaining = self.max_num_batched_tokens - num_batched_tokens - decode_reserve
+            if remaining <= 0:
                 break
             if not seq.block_table:
                 num_cached_blocks = self.block_manager.can_allocate(seq)

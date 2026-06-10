@@ -103,11 +103,12 @@ class TestMixedBatchBasic:
 
         scheduled, has_prefill = sched.schedule()
 
-        # Budget=12: prefill uses 12 (chunked), decode gets 0
-        assert seq_waiting.num_scheduled_tokens == 12
-        # seq_running not scheduled because budget exhausted by prefill
-        assert seq_running.num_scheduled_tokens == 0
-        assert seq_running not in scheduled
+        # Budget=12, decode_reserve=1 → remaining=11 for prefill
+        # Both scheduled: prefill gets 11, decode gets 1
+        assert seq_waiting.num_scheduled_tokens == 11
+        assert seq_running.num_scheduled_tokens == 1
+        assert seq_waiting in scheduled
+        assert seq_running in scheduled
         assert has_prefill is True
 
     def test_pure_decode_fallback(self):
@@ -162,12 +163,11 @@ class TestMixedBatchBasic:
         # (it's in fresh_running, appended after Phase 2)
 
     def test_budget_exhaustion_by_prefill(self):
-        """Small budget, Phase 1 consumes all -> Phase 2 runs zero decode."""
+        """Phase 1 exhausts seq slots → Phase 2 runs zero decode."""
         self.setup_method()
         num_blocks = 10
         bm = BlockManager(num_blocks, BS)
 
-        # Waiting seq exactly fills budget
         seq_waiting = make_seq(list(range(8)))
         seq_running = make_seq(list(range(100, 105)))
         bm.allocate(seq_running, num_cached_blocks=0)
@@ -175,8 +175,8 @@ class TestMixedBatchBasic:
         seq_running.status = SequenceStatus.RUNNING
         seq_running.is_prefill = False
 
-        # Budget=8 means prefill uses all, no room for decode
-        config = make_config(num_blocks, max_batched=8)
+        # max_num_seqs=1: prefill takes the only seq slot, decode gets nothing
+        config = make_config(num_blocks, max_batched=8, max_seqs=1)
         sched = make_scheduler(config, bm,
                                waiting=[],
                                running=deque([seq_running]))
@@ -236,7 +236,7 @@ class TestMixedBatchBasic:
         num_blocks = 50
         bm = BlockManager(num_blocks, BS)
 
-        # Large waiting seq: 30 tokens. Budget=10 means 3 chunks.
+        # Large waiting seq: 30 tokens. Budget=10, decode_reserve=1 → 9-token chunks.
         seq_large = make_seq(list(range(30)))
 
         seq_running = make_seq(list(range(100, 105)))
@@ -251,27 +251,34 @@ class TestMixedBatchBasic:
                                running=deque([seq_running]))
         sched.add(seq_large)
 
-        # Step 1: First chunk (10 tokens) + possible decode
+        # Step 1: First chunk (9 tokens) + decode
         scheduled, has_prefill = sched.schedule()
         assert seq_large in scheduled
-        assert seq_large.num_scheduled_tokens == 10
+        assert seq_large.num_scheduled_tokens == 9
         assert seq_large.is_prefill is True
 
         # Simulate postprocess (chunked prefill: no token generation yet)
         sched.postprocess(scheduled, [99])
-        assert seq_large.num_cached_tokens == 10
+        assert seq_large.num_cached_tokens == 9
         assert seq_large.num_completion_tokens == 0  # mid-prefill, no token
         assert seq_large.status == SequenceStatus.WAITING  # not done
 
         # Step 2: Second chunk + decode
         scheduled, has_prefill = sched.schedule()
-        assert seq_large.num_scheduled_tokens == 10
+        assert seq_large.num_scheduled_tokens == 9
         sched.postprocess(scheduled, [99])
-        assert seq_large.num_cached_tokens == 20
+        assert seq_large.num_cached_tokens == 18
 
-        # Step 3: Final chunk (10 tokens) completes prefill
+        # Step 3: Third chunk + decode
         scheduled, has_prefill = sched.schedule()
-        assert seq_large.num_scheduled_tokens == 10
+        assert seq_large.num_scheduled_tokens == 9
+        sched.postprocess(scheduled, [99])
+        assert seq_large.num_cached_tokens == 27
+        assert seq_large.status == SequenceStatus.WAITING  # still not done
+
+        # Step 4: Final chunk (3 tokens) completes prefill
+        scheduled, has_prefill = sched.schedule()
+        assert seq_large.num_scheduled_tokens == 3
         sched.postprocess(scheduled, [42])
         assert seq_large.num_cached_tokens == 30
         assert seq_large.num_completion_tokens == 1  # prefill complete, token generated
