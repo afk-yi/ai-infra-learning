@@ -179,6 +179,60 @@ class ModelRunner:
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
         return input_ids, positions
 
+    def prepare_mixed(self, seqs: list[Sequence]):
+        input_ids = []
+        positions = []
+        cu_seqlens_q = [0]
+        cu_seqlens_k = [0]
+        max_seqlen_q = 0
+        max_seqlen_k = 0
+        slot_mapping = []
+
+        for seq in seqs:
+            start = seq.num_cached_tokens
+            seqlen_q = seq.num_scheduled_tokens
+            end = start + seqlen_q
+
+            if seq.is_prefill:
+                input_ids.extend(seq[start:end])
+                positions.extend(range(start, end))
+            else:
+                input_ids.append(seq.last_token)
+                positions.append(seq.num_tokens - 1)
+
+            seqlen_k = end
+            cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
+            cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
+            max_seqlen_q = max(seqlen_q, max_seqlen_q)
+            max_seqlen_k = max(seqlen_k, max_seqlen_k)
+
+            if seq.block_table:
+                start_blk = start // self.block_size
+                end_blk = (end + self.block_size - 1) // self.block_size
+                for i in range(start_blk, end_blk):
+                    slot_start = seq.block_table[i] * self.block_size
+                    if i == start_blk:
+                        slot_start += start % self.block_size
+                    if i != end_blk - 1:
+                        slot_end = seq.block_table[i] * self.block_size + self.block_size
+                    else:
+                        slot_end = seq.block_table[i] * self.block_size + end - i * self.block_size
+                    slot_mapping.extend(range(slot_start, slot_end))
+
+        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+
+        block_tables = None
+        if any(seq.block_table for seq in seqs) and cu_seqlens_k[-1] > cu_seqlens_q[-1]:
+            block_tables = self.prepare_block_tables(seqs)
+
+        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+                    slot_mapping, None, block_tables)
+        return input_ids, positions
+
     def prepare_decode(self, seqs: list[Sequence]):
         input_ids = []
         positions = []
@@ -221,10 +275,13 @@ class ModelRunner:
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+    def run(self, seqs: list[Sequence], has_prefill: bool) -> list[int]:
+        if has_prefill:
+            input_ids, positions = self.prepare_mixed(seqs)
+        else:
+            input_ids, positions = self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        logits = self.run_model(input_ids, positions, is_prefill)
+        logits = self.run_model(input_ids, positions, is_prefill=has_prefill)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids

@@ -37,7 +37,8 @@ class Scheduler:
 
         self._reheapify()
 
-        # prefill
+        # Phase 1: Prefill from waiting
+        fresh_running = []  # seqs that complete prefill this step; added to running after Phase 2
         while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
             seq = self.waiting[0][2]
             remaining = self.max_num_batched_tokens - num_batched_tokens
@@ -66,15 +67,17 @@ class Scheduler:
             if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
                 seq.status = SequenceStatus.RUNNING
                 heapq.heappop(self.waiting)
-                self.running.append(seq)
+                fresh_running.append(seq)
             scheduled_seqs.append(seq)
 
-        if scheduled_seqs:
-            return scheduled_seqs, True
-
-        # decode
-        while self.running and len(scheduled_seqs) < self.max_num_seqs:
+        # Phase 2: Decode from running (fill remaining seq slots / token budget)
+        decode_candidates = []
+        while (self.running and len(scheduled_seqs) + len(decode_candidates) < self.max_num_seqs
+               and num_batched_tokens + len(decode_candidates) < self.max_num_batched_tokens):
             seq = self.running.popleft()
+
+            # Preemption loop: make room if needed
+            preempted = False
             while not self.block_manager.can_append(seq):
                 if self.running:
                     victim = self.running.pop()
@@ -89,22 +92,52 @@ class Scheduler:
                     seq.is_prefill = True
                     remaining = seq.num_tokens - seq.num_cached_tokens
                     heapq.heappush(self.waiting, (remaining, next(Sequence.counter), seq))
+                    preempted = True
                     break
-            else:
-                seq.num_scheduled_tokens = 1
-                seq.is_prefill = False
-                self.block_manager.may_append(seq)
-                scheduled_seqs.append(seq)
-        if scheduled_seqs:
-            self.running.extendleft(reversed(scheduled_seqs))
-        return scheduled_seqs, False
+            if preempted:
+                continue
 
-    def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
+            decode_candidates.append(seq)
+
+        # Defer finishing candidates if scheduling them all would leave a lone
+        # straggler — single-token batches are slow due to kernel launch overhead.
+        # Keep at most 1 finishing seq to pair with the straggler; defer the rest.
+        if decode_candidates:
+            finishing = [s for s in decode_candidates if s.num_completion_tokens == s.max_tokens - 1]
+            non_finishing = len(decode_candidates) - len(finishing)
+            running_after = len(self.running) + len(fresh_running) + non_finishing
+            if running_after == 1 and not self.waiting and finishing and non_finishing > 0:
+                defer = finishing[1:]  # keep 1 to pair with the straggler
+                for s in reversed(defer):
+                    self.running.appendleft(s)
+                decode_candidates = [s for s in decode_candidates if s not in defer]
+
+        for seq in decode_candidates:
+            seq.num_scheduled_tokens = 1
+            seq.is_prefill = False
+            self.block_manager.may_append(seq)
+            scheduled_seqs.append(seq)
+            num_batched_tokens += 1
+
+        if scheduled_seqs:
+            decode_seqs = [s for s in scheduled_seqs if not s.is_prefill]
+            self.running.extendleft(reversed(decode_seqs))
+
+        # Add freshly prefilled seqs to running after Phase 2 so they aren't
+        # scheduled for decode in the same step (which would clobber is_prefill
+        # and num_scheduled_tokens set during Phase 1).
+        for seq in fresh_running:
+            self.running.append(seq)
+
+        has_prefill = any(s.is_prefill for s in scheduled_seqs)
+        return scheduled_seqs, has_prefill
+
+    def postprocess(self, seqs: list[Sequence], token_ids: list[int]):
         for seq, token_id in zip(seqs, token_ids):
             self.block_manager.hash_blocks(seq)
             seq.num_cached_tokens += seq.num_scheduled_tokens
             seq.num_scheduled_tokens = 0
-            if is_prefill and seq.num_cached_tokens < seq.num_tokens:
+            if seq.is_prefill and seq.num_cached_tokens < seq.num_tokens:
                 continue
             seq.append_token(token_id)
             if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
